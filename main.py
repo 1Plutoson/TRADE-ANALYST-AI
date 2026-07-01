@@ -1,127 +1,170 @@
 import os
-import asyncio
 import pandas as pd
 import yfinance as yf
 import google.generativeai as genai
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from backtesting import Backtest, Strategy
+from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
-genai.configure(api_key=os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_KEY"))
+# ==========================================
+# 1. ENVIRONMENT & API SETUP
+# ==========================================
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- MODULE 1: MARKET STRUCTURE (THE CHART MAPPER) ---
-def map_market_structure(ticker, period="1mo", interval="1h"):
-    """Fetches data and calculates HH, HL, LH, LL using swing highs/lows."""
-    df = yf.download(ticker, period=period, interval=interval, progress=False)
-    
-    if df.empty:
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    raise ValueError("🚨 MISSING API KEYS: Check your .env file!")
+
+genai.configure(api_key=GEMINI_API_KEY)
+
+# ==========================================
+# 2. DATA PIPELINE & CHART MAPPER
+# ==========================================
+def fetch_clean_data(ticker, period="1y", interval="1d"):
+    """Fetches data and fixes the yfinance MultiIndex bug that breaks backtesting."""
+    try:
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if df.empty:
+            return None
+        
+        # FIX: Flatten MultiIndex columns so backtesting.py doesn't crash
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+            
+        return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+    except Exception as e:
+        print(f"Data fetch error: {e}")
         return None
-    
-    # Simple swing high/low detection (5-candle window)
+
+def map_market_structure(df):
+    """Maps out Higher Highs, Higher Lows, Lower Highs, and Lower Lows."""
     window = 5
     df['Swing_High'] = df['High'][df['High'] == df['High'].rolling(window=window*2+1, center=True).max()]
     df['Swing_Low'] = df['Low'][df['Low'] == df['Low'].rolling(window=window*2+1, center=True).min()]
     
-    # Get the latest price action narrative
-    recent_highs = df['Swing_High'].dropna().tail(2).values
-    recent_lows = df['Swing_Low'].dropna().tail(2).values
+    highs = df['Swing_High'].dropna()
+    lows = df['Swing_Low'].dropna()
     
-    structure_narrative = "Market Structure: "
-    if len(recent_highs) == 2 and recent_highs[1] > recent_highs[0]:
-        structure_narrative += "Higher Highs (HH) detected. "
-    elif len(recent_highs) == 2 and recent_highs[1] < recent_highs[0]:
-        structure_narrative += "Lower Highs (LH) detected. "
+    narrative = "Market Structure: "
+    if len(highs) >= 2 and highs.iloc[-1] > highs.iloc[-2]:
+        narrative += "Higher Highs (HH). "
+    elif len(highs) >= 2:
+        narrative += "Lower Highs (LH). "
         
-    if len(recent_lows) == 2 and recent_lows[1] > recent_lows[0]:
-        structure_narrative += "Higher Lows (HL) - Bullish structure. "
-    elif len(recent_lows) == 2 and recent_lows[1] < recent_lows[0]:
-        structure_narrative += "Lower Lows (LL) - Bearish structure. "
+    if len(lows) >= 2 and lows.iloc[-1] > lows.iloc[-2]:
+        narrative += "Higher Lows (HL) - Bullish structure."
+    elif len(lows) >= 2:
+        narrative += "Lower Lows (LL) - Bearish structure."
 
-    current_price = df['Close'].iloc[-1]
-    
-    return {
-        "ticker": ticker,
-        "current_price": float(current_price.iloc[0]) if isinstance(current_price, pd.Series) else float(current_price),
-        "structure": structure_narrative,
-        "raw_data": df.tail(20) # Last 20 candles for the AI
-    }
+    return narrative
 
-# --- MODULE 2: NEWS FETCHING ---
-def fetch_latest_news(ticker):
-    """Fetches recent news headlines to provide fundamental context to the AI."""
-    stock = yf.Ticker(ticker)
-    news = stock.news
-    headlines = [item['title'] for item in news[:3]] if news else ["No recent major news."]
-    return headlines
+# ==========================================
+# 3. BACKTESTING MODULE
+# ==========================================
+def detect_swing_high(high_series, window=5):
+    return high_series == high_series.rolling(window=window*2+1, center=True).max()
 
-# --- MODULE 3: THE AI DRIVEN ANALYST ---
-def generate_ai_analysis(market_data, news_data, strategy_preference):
-    """Feeds the technicals and fundamentals to the LLM to act as a financial analyst."""
-    model = genai.GenerativeModel('gemini-2.5-flash') # Fast model for snappy responses
-    
+class MarketStructureStrategy(Strategy):
+    def init(self):
+        self.swing_highs = self.I(detect_swing_high, pd.Series(self.data.High))
+
+    def next(self):
+        if self.swing_highs[-1]:
+            self.position.close()
+            # Dynamic TP/SL built directly into the backtest engine
+            self.buy(sl=self.data.Close[-1] * 0.98, tp=self.data.Close[-1] * 1.04)
+
+def run_quick_backtest(ticker):
+    """Runs a historical backtest to validate the strategy logic before asking the AI."""
+    df = fetch_clean_data(ticker, period="1y", interval="1d")
+    if df is None or len(df) < 50: 
+        return "Insufficient data for backtest."
+    bt = Backtest(df, MarketStructureStrategy, cash=10000, commission=.002)
+    stats = bt.run()
+    return f"Historical Return: {stats['Return [%]']:.2f}% | Win Rate: {stats['Win Rate [%]']:.2f}%"
+
+# ==========================================
+# 4. THE AI DRIVEN ANALYST
+# ==========================================
+def generate_ai_analysis(ticker, price, structure, news, strategy, backtest_stats):
+    model = genai.GenerativeModel('gemini-2.5-flash')
     prompt = f"""
-    You are an expert financial analyst and proprietary trader. 
-    Review the following asset: {market_data['ticker']}
-    Current Price: {market_data['current_price']}
+    You are an elite AI Proprietary Trader.
+    Asset: {ticker} @ {price}
+    Strategy Selected by User: {strategy}
+    Current Technical Structure: {structure}
+    Backtest of Core Strategy Logic: {backtest_stats}
+    Latest Market News: {news}
     
-    Technical State (Market Structure):
-    {market_data['structure']}
-    
-    Recent News/Fundamentals:
-    {news_data}
-    
-    The user prefers the following strategy: {strategy_preference}.
-    
-    Based on the market structure (HH, HL, LH, LL) and the news, provide a trade signal.
-    Format your response strictly as:
+    Provide a highly accurate trade setup. Determine if the setup is currently valid or invalid.
+    Output your response cleanly without using markdown symbols that could break a Telegram bot:
     
     🎯 SIGNAL: [BUY, SELL, or HOLD]
-    📊 REASONING: [Brief technical and fundamental justification]
+    📊 REASONING: [Explain why based on the structure and news]
     💰 ENTRY ZONE: [Price range]
-    🛑 STOP LOSS (SL): [Strict price level based on recent swing low/high]
-    🏆 TAKE PROFIT (TP): [Price level targeting the next liquidity zone]
-    ⚠️ RISK MANAGEMENT: [Position sizing or validity warning, e.g., "Invalidate if 1H candle closes below SL"]
+    🛑 STOP LOSS: [Strict price level based on recent swing low/high]
+    🏆 TAKE PROFIT: [Price level targeting the next liquidity zone]
+    ⚠️ RISK MANAGEMENT: [Position size advice and state exactly what makes this trade invalid]
     """
-    
-    response = model.generate_content(prompt)
-    return response.text
+    return model.generate_content(prompt).text
 
-# --- MODULE 4: TELEGRAM BOT INTERFACE ---
+# ==========================================
+# 5. TELEGRAM BOT CONTROLLER
+# ==========================================
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triggered by /analyze <ticker> <strategy>"""
+    # Ensure user provided a ticker
     if len(context.args) < 1:
         await update.message.reply_text("Usage: /analyze <TICKER> <STRATEGY>\nExample: /analyze BTC-USD Breakout")
         return
 
     ticker = context.args[0].upper()
+    # If user doesn't provide a strategy, default to Trend Following
     strategy = " ".join(context.args[1:]) if len(context.args) > 1 else "Trend Following"
 
-    await update.message.reply_text(f"🔍 AI Analyst is mapping charts and reading news for {ticker}...")
+    # Send a waiting message
+    msg = await update.message.reply_text(f"⚙️ AI Analyst is mapping charts and backtesting {ticker}...")
 
     try:
-        # 1. Analyze (Chart Mapping)
-        market_data = map_market_structure(ticker)
-        if not market_data:
-            await update.message.reply_text(f"Could not fetch data for {ticker}.")
+        df = fetch_clean_data(ticker)
+        if df is None:
+            await msg.edit_text(f"⚠️ Could not fetch market data for {ticker}.")
             return
+
+        current_price = df['Close'].iloc[-1]
+        structure = map_market_structure(df)
+        
+        # Fetch actual news safely
+        news = "No major breaking news"
+        try:
+            news_data = yf.Ticker(ticker).news
+            if news_data: 
+                news = news_data[0].get('title', 'No major breaking news')
+        except Exception:
+            pass
             
-        # 2. News Gathering
-        news_data = fetch_latest_news(ticker)
+        # Run Backtest
+        backtest_results = run_quick_backtest(ticker)
         
-        # 3. AI Plan & Signal Generation
-        analysis_report = generate_ai_analysis(market_data, news_data, strategy)
+        # Trigger the AI Analyst
+        ai_report = generate_ai_analysis(ticker, current_price, structure, news, strategy, backtest_results)
         
-        # 4. Act (Send to User)
-        await update.message.reply_text(f"*{ticker} Analysis Report*\n\n{analysis_report}", parse_mode="Markdown")
+        # Edit the original message with the final report
+        await msg.edit_text(f"{ticker} AI Analyst Report:\n\n{ai_report}")
         
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error during analysis: {str(e)}")
+        await msg.edit_text(f"🚨 Critical Error during analysis: {str(e)}")
 
-# --- MAIN EXECUTION ---
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
 if __name__ == '__main__':
-    print("Starting AI Analyst Bot...")
+    print("Initializing AI Analyst Engine...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    
+    # Add the analyze command handler
     app.add_handler(CommandHandler("analyze", analyze_command))
-    print("Bot is polling. Send /analyze in Telegram.")
+    
+    print("Bot is successfully polling! Open Telegram and type /analyze to test.")
     app.run_polling()
