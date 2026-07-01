@@ -4,3 +4,4 @@ pandas-ta==0.3.14b0
 yfinance==0.2.40
 google-generativeai==0.7.2
 backtesting==0.3.3
+python-dotenv
