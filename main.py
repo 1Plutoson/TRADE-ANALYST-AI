@@ -3,13 +3,12 @@ import asyncio
 import pandas as pd
 import yfinance as yf
 import google.generativeai as genai
+import uvicorn
+from fastapi import FastAPI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from backtesting import Backtest, Strategy
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
 
 # ==========================================
 # 1. ENVIRONMENT & API SETUP
@@ -19,7 +18,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print("🚨 FATAL ERROR: Missing API Keys! Check your .env or Railway Variables.")
+    print("🚨 FATAL ERROR: Missing API Keys! If on Railway, check the 'Variables' tab.")
     exit(1)
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -28,32 +27,18 @@ genai.configure(api_key=GEMINI_API_KEY)
 active_monitors = {}
 
 # ==========================================
-# 2. FASTAPI WEB3 RECEIVER (ENDPOINTS)
+# 2. FASTAPI RECEIVER (WEB3 ENDPOINTS)
 # ==========================================
-# Renamed to api_app to avoid collision with Telegram's app
-api_app = FastAPI(title="Ultra Market Platform")
+api_app = FastAPI(title="Ultra Market Platform API")
 
-class SwapRequest(BaseModel):
-    target_asset: str
-    amount: float
+@api_app.get("/")
+async def root():
+    return {"status": "online", "message": "Ultra Market Platform Backend is running."}
 
-@api_app.post("/api/build_swap")
-async def build_dex_swap(request: SwapRequest):
-    """
-    Fetches the best DEX route, enforces the dynamic fee matrix, 
-    and returns a raw unsigned transaction.
-    """
-    # Your Web3 swap logic goes here
-    return {"status": "success", "asset": request.target_asset, "amount": request.amount}
-
+# (Add your Web3 /api/build_swap and /api/broadcast_trade endpoints here)
 @api_app.post("/api/broadcast_trade")
-async def broadcast_trade(payload: dict):
-    """
-    Catches signed Base64 transaction payloads from frontend, 
-    transmits to RPC nodes, and verifies signature.
-    """
-    # Your Web3 broadcast logic goes here
-    return {"status": "broadcasted", "tx_signature": "simulated_tx_sig"}
+async def broadcast_trade():
+    return {"status": "success", "message": "Transaction broadcasted."}
 
 
 # ==========================================
@@ -94,7 +79,6 @@ def map_market_structure(df):
 
     return narrative
 
-
 # ==========================================
 # 4. BACKTESTING MODULE
 # ==========================================
@@ -121,7 +105,6 @@ def run_quick_backtest(ticker):
         return f"Historical Return: {stats['Return [%]']:.2f}% | Win Rate: {stats['Win Rate [%]']:.2f}%"
     except:
         return "Backtest Engine Error."
-
 
 # ==========================================
 # 5. THE AI DRIVEN ANALYST
@@ -156,12 +139,10 @@ def generate_ai_analysis(ticker, price, structure, news, strategy, backtest_stat
         """
     return model.generate_content(prompt).text
 
-
 # ==========================================
 # 6. TELEGRAM BOT CONTROLLERS & BACKGROUND JOBS
 # ==========================================
 async def fetch_and_analyze(ticker, strategy, is_update=False):
-    """Helper function to fetch all data and call the AI."""
     df = fetch_clean_data(ticker)
     if df is None: return None
     
@@ -178,7 +159,6 @@ async def fetch_and_analyze(ticker, strategy, is_update=False):
     return generate_ai_analysis(ticker, current_price, structure, news, strategy, backtest_results, is_update)
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /analyze <TICKER> <STRATEGY>"""
     if len(context.args) < 1:
         await update.message.reply_text("Usage: /analyze <TICKER> <STRATEGY>")
         return
@@ -197,7 +177,6 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"🚨 Critical Error: {str(e)}")
 
 async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /monitor <TICKER> <STRATEGY> - Adds to background loop"""
     if len(context.args) < 1:
         await update.message.reply_text("Usage: /monitor <TICKER> <STRATEGY>")
         return
@@ -206,14 +185,12 @@ async def monitor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     strategy = " ".join(context.args[1:]) if len(context.args) > 1 else "Trend Following"
     chat_id = update.message.chat_id
     
-    # Store in memory for background tracking
     active_monitors[f"{chat_id}_{ticker}"] = {"chat_id": chat_id, "ticker": ticker, "strategy": strategy}
     
     await update.message.reply_text(f"👀 Now monitoring {ticker} for {strategy} setups. I will alert you if market structure breaks or validity changes.")
     await analyze_command(update, context)
 
 async def check_active_monitors(context: ContextTypes.DEFAULT_TYPE):
-    """Background Job: Runs periodically to check all active monitors."""
     for key, data in list(active_monitors.items()):
         try:
             update_report = await fetch_and_analyze(data['ticker'], data['strategy'], is_update=True)
@@ -225,9 +202,8 @@ async def check_active_monitors(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"Monitor error for {data['ticker']}: {e}")
 
-
 # ==========================================
-# 7. UNIFIED ASYNC EXECUTION ENGINE (RAILWAY OPTIMIZED)
+# 7. UNIFIED ASYNC EXECUTION ENGINE (RAILWAY)
 # ==========================================
 async def start_services():
     print("🚀 Initializing Ultra Market Platform...")
@@ -235,13 +211,13 @@ async def start_services():
     # 1. Setup Telegram Bot (Named bot_app to avoid collision)
     bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # Register your commands
+    # Register Commands
     bot_app.add_handler(CommandHandler("analyze", analyze_command))
     bot_app.add_handler(CommandHandler("monitor", monitor_command))
     
-    # Register Background Job (Runs every 1 hour)
-    if bot_app.job_queue:
-        bot_app.job_queue.run_repeating(check_active_monitors, interval=3600, first=3600)
+    # Register Background Job (Runs every 3600 seconds / 1 Hour)
+    job_queue = bot_app.job_queue
+    job_queue.run_repeating(check_active_monitors, interval=3600, first=3600)
     
     print("🤖 Starting Telegram Bot in the background...")
     # Initialize and start polling asynchronously 
@@ -263,7 +239,6 @@ async def start_services():
     await bot_app.updater.stop()
     await bot_app.stop()
     await bot_app.shutdown()
-
 
 # ==========================================
 # PROPER PYTHON ENTRY POINT
