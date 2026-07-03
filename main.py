@@ -23,7 +23,6 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Global dictionary to track active trades for the monitoring engine
 active_monitors = {}
 
 # ==========================================
@@ -35,21 +34,17 @@ api_app = FastAPI(title="Ultra Market Platform API")
 async def root():
     return {"status": "online", "message": "Ultra Market Platform Backend is running."}
 
-# (Add your Web3 /api/build_swap and /api/broadcast_trade endpoints here)
 @api_app.post("/api/broadcast_trade")
 async def broadcast_trade():
     return {"status": "success", "message": "Transaction broadcasted."}
-
 
 # ==========================================
 # 3. DATA PIPELINE & CHART MAPPER
 # ==========================================
 def fetch_clean_data(ticker, period="1mo", interval="1h"):
-    """Fetches data and fixes the yfinance MultiIndex bug."""
     try:
         df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if df.empty:
-            return None
+        if df.empty: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.droplevel(1)
         return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
@@ -58,7 +53,6 @@ def fetch_clean_data(ticker, period="1mo", interval="1h"):
         return None
 
 def map_market_structure(df):
-    """Maps out Higher Highs, Higher Lows, Lower Highs, and Lower Lows."""
     window = 5
     df['Swing_High'] = df['High'][df['High'] == df['High'].rolling(window=window*2+1, center=True).max()]
     df['Swing_Low'] = df['Low'][df['Low'] == df['Low'].rolling(window=window*2+1, center=True).min()]
@@ -76,7 +70,6 @@ def map_market_structure(df):
         narrative += "Higher Lows (HL) - Bullish structure."
     elif len(lows) >= 2:
         narrative += "Lower Lows (LL) - Bearish structure."
-
     return narrative
 
 # ==========================================
@@ -95,7 +88,6 @@ class MarketStructureStrategy(Strategy):
             self.buy(sl=self.data.Close[-1] * 0.98, tp=self.data.Close[-1] * 1.04)
 
 def run_quick_backtest(ticker):
-    """Runs a historical backtest to validate logic."""
     df = fetch_clean_data(ticker, period="1y", interval="1d")
     if df is None or len(df) < 50: 
         return "Insufficient data for backtest."
@@ -202,47 +194,44 @@ async def check_active_monitors(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"Monitor error for {data['ticker']}: {e}")
 
+# --- NEW PING COMMAND ---
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostic command to prove the bot is listening."""
+    await update.message.reply_text("🏓 PONG! The Telegram connection is absolutely working. The backlog is cleared, and the bot can hear you!")
+
 # ==========================================
 # 7. UNIFIED ASYNC EXECUTION ENGINE (RAILWAY)
 # ==========================================
 async def start_services():
     print("🚀 Initializing Ultra Market Platform...")
 
-    # 1. Setup Telegram Bot (Named bot_app to avoid collision)
     bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
     # Register Commands
+    bot_app.add_handler(CommandHandler("ping", ping_command)) # <--- INJECTED PING
     bot_app.add_handler(CommandHandler("analyze", analyze_command))
     bot_app.add_handler(CommandHandler("monitor", monitor_command))
     
-    # Register Background Job (Runs every 3600 seconds / 1 Hour)
     job_queue = bot_app.job_queue
     job_queue.run_repeating(check_active_monitors, interval=3600, first=3600)
     
     print("🤖 Starting Telegram Bot in the background...")
-    # Initialize and start polling asynchronously 
     await bot_app.initialize()
     await bot_app.start()
-    await bot_app.updater.start_polling() 
+    
+    # 🚨 CRITICAL FIX: drop_pending_updates=True wipes the backlog from your screenshot!
+    await bot_app.updater.start_polling(drop_pending_updates=True) 
 
-    # 2. Setup FastAPI Web3 Receiver
     print("🌐 Starting FastAPI Receiver on Port 8000...")
-    # Pass the renamed api_app directly to Uvicorn
     config = uvicorn.Config(app=api_app, host="0.0.0.0", port=8000, reload=False)
     server = uvicorn.Server(config)
     
-    # 3. Serve API (This blocks the main thread, keeping everything alive)
     await server.serve()
 
-    # 4. Graceful Shutdown Protocol (Triggers only if server is killed)
     print("Shutting down services...")
     await bot_app.updater.stop()
     await bot_app.stop()
     await bot_app.shutdown()
 
-# ==========================================
-# PROPER PYTHON ENTRY POINT
-# ==========================================
 if __name__ == "__main__":
-    # Fire up both services simultaneously in the same event loop
     asyncio.run(start_services())
