@@ -194,7 +194,7 @@ async def check_active_monitors(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"Monitor error for {data['ticker']}: {e}")
 
-# --- NEW PING COMMAND ---
+# --- PING COMMAND ---
 async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Diagnostic command to prove the bot is listening."""
     await update.message.reply_text("🏓 PONG! The Telegram connection is absolutely working. The backlog is cleared, and the bot can hear you!")
@@ -208,7 +208,7 @@ async def start_services():
     bot_app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
     # Register Commands
-    bot_app.add_handler(CommandHandler("ping", ping_command)) # <--- INJECTED PING
+    bot_app.add_handler(CommandHandler("ping", ping_command))
     bot_app.add_handler(CommandHandler("analyze", analyze_command))
     bot_app.add_handler(CommandHandler("monitor", monitor_command))
     
@@ -219,11 +219,14 @@ async def start_services():
     await bot_app.initialize()
     await bot_app.start()
     
-    # 🚨 CRITICAL FIX: drop_pending_updates=True wipes the backlog from your screenshot!
+    # 🚨 Wipes the backlog from Telegram so it doesn't instantly crash
     await bot_app.updater.start_polling(drop_pending_updates=True) 
 
-    print("🌐 Starting FastAPI Receiver on Port 8000...")
-    config = uvicorn.Config(app=api_app, host="0.0.0.0", port=8000, reload=False)
+    # 🚨 CRITICAL RAILWAY FIX: Use their dynamic port instead of hardcoded 8000
+    PORT = int(os.environ.get("PORT", 8000))
+    print(f"🌐 Starting FastAPI Receiver on Port {PORT}...")
+    
+    config = uvicorn.Config(app=api_app, host="0.0.0.0", port=PORT, reload=False)
     server = uvicorn.Server(config)
     
     await server.serve()
